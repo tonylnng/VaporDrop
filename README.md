@@ -117,18 +117,20 @@ sequenceDiagram
     participant B as 瀏覽器
     participant A as FastAPI
     participant R as Redis
+    participant D as SQLite
 
-    Note over U,A: 前置：管理員用 CLI 產生一次性 invite code<br/>vapor invite --ttl 15m
-    U->>B: 開啟 /register?invite=XXXX
+    Note over U,A: 前置：管理員用 CLI 產生一次性 invite code<br/>python -m app.cli invite --note "Ian"
+    U->>B: 開啟 /?invite=XXXX
     B->>A: POST /auth/register/begin { invite }
-    A->>R: 驗證 invite code · 立即標記已用
+    A->>D: 驗證 invite code · 立即標記已用
+    A->>R: 暫存 challenge（chal:reg:{flow}，300s，取用即刪）
     A-->>B: PublicKeyCredentialCreationOptions<br/>challenge · rp_id · user_verification=required
     B->>U: 觸發 Touch ID
     U-->>B: 生物認證通過
     B->>B: 產生 key pair · 私鑰留在 Secure Enclave
     B->>A: POST /auth/register/finish { attestation }
     A->>A: 驗證 challenge · origin · signature
-    A->>R: 儲存 credential_id + public_key<br/>唯一持久化資料 · 不含個人資訊
+    A->>D: 寫入 SQLite credentials<br/>credential_id + public_key<br/>唯一持久化資料 · 不含個人資訊
     A-->>B: 201 Created
 ```
 
@@ -167,7 +169,7 @@ sequenceDiagram
 
     U->>B: 點「新 Session」
     B->>A: POST /api/sessions
-    A->>R: SET blob:{cid}:meta EX 600<br/>owner=uid · created_at
+    A->>R: HSET blob:{cid}:meta EX 600<br/>owner=uid · created_at
     A-->>B: { cid, expires_at }
     B->>B: crypto.getRandomValues 產生 256-bit 金鑰<br/>存入 sessionStorage · 寫入 URL fragment
     U->>B: 貼上文字 / 選擇檔案
@@ -175,7 +177,7 @@ sequenceDiagram
     B->>A: PUT /api/sessions/{cid}/items<br/>body = 密文
     A->>A: 檢查 owner · 大小上限 · 不解析內容
     A->>T: 寫入 /vapor/{cid}/{itemid}.bin
-    A->>R: SADD blob:{cid}:items · 續設 TTL
+    A->>R: HSET blob:{cid}:items · TTL 對齊 meta 剩餘秒數（不延長）
     A-->>B: { item_id }
     B->>U: 顯示分享連結 https://host/s/{cid}#k=BASE64URL<br/>+ 一次性 token · 倒數 10:00
 ```
@@ -452,60 +454,129 @@ services:
       RP_ID: vapor.example.com
 ```
 
-### 7.3 Redis Key 設計
+### 7.3 資料分層與 Key 設計
+
+完整版（含每個欄位、TTL 規則、密碼學細節）見 **[docs/DATA_MODEL.md](docs/DATA_MODEL.md)**。摘要：
+
+**持久層 — SQLite `/data/vapor.db`（唯一需要備份的東西）**
+
+| 表 | 內容 |
+|----|------|
+| `users` | `uid`、`handle`、`created_at`、`disabled` |
+| `credentials` | Passkey 公鑰、`sign_count`、`transports`、`label`、`last_used_at` |
+| `invites` | 一次性註冊碼、`expires_at`、`used_at`、`used_by` |
+
+**揮發層 — Redis（`--save "" --appendonly no`，每個 key 都必須有 TTL）**
 
 | Key | 型別 | TTL | 內容 |
 |-----|------|-----|------|
-| `cred:{credential_id}` | hash | 無（唯一持久資料） | public_key, sign_count |
-| `invite:{code}` | string | 900s | 未使用標記 |
-| `auth:{sid}` | string | 1800s（滑動） | uid |
-| `blob:{cid}:meta` | hash | 600s（固定） | owner, created_at, bytes, burn |
-| `blob:{cid}:items` | set | 600s（固定） | item_id 清單 |
-| `tok:{token}` | hash | 600s | cid, uses_remaining |
-| `rl:{hmac_ip}:{window}` | string | 60s | 計數 |
+| `auth:{sid}` | hash | 1800s（滑動） | `uid`、`created_at`、`last_seen` |
+| `chal:reg\|auth:{flow}` | string | 300s | WebAuthn challenge，取用即刪 |
+| `blob:{cid}:meta` | hash | 600s（**永不續期**） | `owner`、`label`(密文)、`expires_at`、`bytes`、`burn`、`plain` |
+| `blob:{cid}:items` | hash | 對齊 meta 剩餘 | `iid` → JSON（`name` 密文、`kind`、`size`） |
+| `tok:{token}` | hash | `min(內容剩餘, 請求值)` | `cid`、`uses`（`HINCRBY` 原子扣減） |
+| `user:{uid}:blobs` | set | 2400s | 該用戶的 cid 集合 |
 
-### 7.4 實作階段
+**揮發層 — tmpfs `/vapor/{cid}/{iid}.bin`**：`iv(12B) ‖ ciphertext‖tag`，刪除時隨機覆寫 + fsync 再 unlink。
 
-```mermaid
-gantt
-    title VaporDrop 實作路線
-    dateFormat YYYY-MM-DD
-    axisFormat %m/%d
-    section 骨架
-    Compose + Caddy + Redis + FastAPI 骨架 :a1, 2026-08-22, 1d
-    section 認證
-    Passkey 註冊與登入 + invite CLI       :a2, after a1, 2d
-    Session cookie 與 idle 逾時           :a3, after a2, 1d
-    section 內容
-    Session CRUD + TTL + 配額             :b1, after a3, 1d
-    WebCrypto 端到端加密與分塊上傳        :b2, after b1, 2d
-    一次性 token 與 raw 端點              :b3, after b2, 1d
-    Sweeper 與安全覆寫刪除                :b4, after b3, 1d
-    section 加固
-    Header 硬化 · 無日誌驗證 · Rate limit :c1, after b4, 1d
-    自我滲透測試與清單覆核                :c2, after c1, 1d
+速率限制桶在程序內記憶體，key 是 `HMAC(每日輪換 salt, IP)`，**不存 IP 原文**。
+
+刻意不存在：`sessions`、`contents`、`access_log`、`audit_trail`、`shares`。
+
+### 7.4 專案結構
+
+```
+VaporDrop/
+├── README.md                  本文件：完整方案與架構
+├── schema.sql                 SQLite schema（含「刻意不建的表」註記）
+├── Dockerfile                 python:3.12-slim，uid 10001，唯讀根檔案系統
+├── docker-compose.yml          redis（零持久化）+ api（read_only）+ caddy（無日誌）
+├── Caddyfile                  TLS、request_body 上限、log discard
+├── .env.example               所有可調參數（附中文說明）
+├── Makefile                   up / down / test / dev / invite / verify / nuke
+├── app/
+│   ├── main.py                FastAPI 入口、lifespan、sweeper、/healthz、/metrics
+│   ├── config.py              環境變數與預設值
+│   ├── db.py                  SQLite（Passkey 憑證、邀請碼）
+│   ├── store.py               Redis + tmpfs：TTL 不變量、覆寫抹除、sweeper
+│   ├── security.py            安全標頭、速率限制、session cookie、same-origin
+│   ├── auth_routes.py         WebAuthn 註冊 / 登入 / 裝置管理 / 登出
+│   ├── session_routes.py      內容 session CRUD、token、/s/{cid}/raw
+│   ├── cli.py                 invite / users / disable / purge
+│   └── static/                index.html、receive.html、css、js（vcrypto/webauthn/api/app/receive）
+├── scripts/
+│   ├── vapor_fetch.py         接收端 CLI（僅需 python3 + cryptography）
+│   └── verify.sh              部署後 15 項自動驗收
+├── tools/devserver.py         本機開發用（fakeredis，免 Docker）
+├── tests/test_lifecycle.py    13 項安全與生命週期測試
+└── docs/
+    ├── DEPLOY.md              部署步驟（寫給部署的人或 AI Agent）
+    ├── DATA_MODEL.md          資料模型與密碼學細節
+    └── SECURITY.md            威脅模型、控制項、驗收清單
 ```
 
----
+### 7.5 API
+
+| 方法 | 路徑 | 說明 |
+|------|------|------|
+| GET | `/auth/state` | 是否已登入、是否可 bootstrap |
+| POST | `/auth/register/begin` `/finish` | Passkey 註冊（需邀請碼，首位用戶例外） |
+| POST | `/auth/login/begin` `/finish` | 免輸入帳號的 discoverable 登入 |
+| GET/DELETE | `/auth/credentials` | 列出 / 移除 Passkey 裝置 |
+| POST | `/auth/logout` | 登出並清空該用戶所有內容 |
+| POST/GET | `/api/sessions` | 開新 session / 列出自己的 session |
+| PUT | `/api/sessions/{cid}/items` | 上傳密文（`X-Vapor-Name`、`X-Vapor-Kind`） |
+| DELETE | `/api/sessions/{cid}` | 立即銷毀 |
+| POST | `/api/sessions/{cid}/tokens` | 產生限次取用 token |
+| GET | `/api/receive/{cid}` | 接收端取 manifest（不消耗次數） |
+| GET | `/s/{cid}/raw` | 取密文（消耗次數，強制 attachment） |
+| GET | `/healthz` `/metrics` | 健康檢查、兩個聚合數字 |
+
+### 7.6 快速開始
+
+```bash
+git clone https://github.com/tonylnng/VaporDrop.git && cd VaporDrop
+cp .env.example .env          # 至少改 SITE_ADDRESS / RP_ID / ORIGINS
+make up                       # docker compose up -d --build
+# 開 https://your-domain → 展開「第一次使用」→ 註冊第一個 Passkey
+make verify URL=https://your-domain
+```
+
+之後把 `ALLOW_FIRST_USER_BOOTSTRAP` 改為 `false`，用 `make invite` 邀請其他人。
+完整步驟（含 Tailscale / Cloudflare Tunnel 變體）見 **[docs/DEPLOY.md](docs/DEPLOY.md)**。
+
+接收端（VM / AI Agent）：
+
+```bash
+export VAPOR_URL="https://your-domain/s/<cid>"
+export VAPOR_TOKEN="<t>"   # 來自分享連結 fragment
+export VAPOR_KEY="<k>"
+python3 scripts/vapor_fetch.py --all -o ./inbox
+```
 
 ## 8. 驗收清單
 
 - [ ] 上傳後查 Redis 與 tmpfs：只見密文，無明文片段。
 - [ ] 601 秒後 `GET /s/{cid}/raw` 回 404，且 tmpfs 內無殘檔。
 - [ ] Caddy 與 app 容器 `docker logs` 中無任何 URL、IP、UA。
-- [ ] 一次性 token 第二次使用回 401。
+- [ ] 一次性 token 第二次使用回 404（不洩漏存在性）。
 - [ ] 上傳 `evil.html` 後訪問，瀏覽器下載而非渲染。
 - [ ] 31 分鐘閒置後任何 API 回 401，且該用戶所有 session 已清空。
+- [ ] `python -m pytest tests -q` 全數通過（13 項）。
+- [ ] `./scripts/verify.sh https://your-domain` 15 項全過。
 - [ ] 從另一帳號嘗試存取他人 `cid` 回 404（非 403，避免存在性洩漏）。
 - [ ] 容器重啟後：Passkey 仍可登入，內容全數消失。
 - [ ] 移除 `#k=` 後開啟連結：頁面明確提示缺少金鑰，無法解密。
 
 ---
 
-## 9. 下一步
+## 9. 現況與待你決定的事
 
-確認以下三項後即可進入實作：
+**現況**：程式碼、資料庫 schema、Docker 編排、接收端 CLI、驗收腳本與 13 項測試皆已完成並通過；瀏覽器端到端流程（虛擬 Passkey 註冊 → 加密上傳 → 一次性 token → 接收頁與 CLI 解密）已實測成功，伺服器端 blob 確認為密文。
 
-1. **入口方式**：純 Tailscale tailnet ／ Cloudflare Tunnel 公網 ／ 兩者並行。
-2. **Agent 便利性取捨**：是否啟用 `plain` 模式（伺服器端持金鑰，換一條 curl 搞定）。
-3. **檔案上限**：單檔 32 MB 與總量 128 MB 是否足夠（受 tmpfs 即 RAM 限制）。
+**仍需你決定**：
+
+1. **入口方式**：純 Tailscale tailnet（隱私最高）／ Cloudflare Tunnel ／ 直接公網 + Let's Encrypt。三種都已寫在 [docs/DEPLOY.md](docs/DEPLOY.md)，只差選一個。
+2. **是否啟用 `ALLOW_SERVER_SIDE_PLAIN`**：開了接收端一條 `curl` 就能拿明文，代價是伺服器看得見內容。預設關。
+3. **檔案上限**：單檔 32 MB、單 session 128 MB（tmpfs 佔 RAM，調大請同步調 `MAX_BODY_SIZE` 與 tmpfs size）。
+4. **repo 可見性**：目前為 public。安全性不依賴程式碼保密，但若不想公開部署細節，建議改 private。

@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>VaporDrop</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">Vapor<span>Drop</span></div>
+  <div class="bar-right">
+    <span id="idle" class="pill hidden" title="閒置逾時倒數"></span>
+    <span id="who" class="pill hidden"></span>
+    <button id="btn-logout" class="btn ghost hidden">登出</button>
+  </div>
+</header>
+
+<main>
+  <!-- 未登入 -->
+  <section id="view-auth" class="hidden">
+    <div class="card center">
+      <h1>零知識暫存傳送門</h1>
+      <p class="muted">內容 10 分鐘自動蒸發，伺服器只見密文，不留日誌。</p>
+      <button id="btn-login" class="btn primary big">用 Passkey 登入</button>
+      <p id="auth-msg" class="msg"></p>
+      <hr>
+      <details id="reg-block">
+        <summary>第一次使用 / 我有邀請碼</summary>
+        <label>Handle
+          <input id="reg-handle" type="text" autocomplete="username webauthn"
+                 placeholder="3-32 個字母、數字、. _ -" maxlength="32">
+        </label>
+        <label id="reg-invite-row">邀請碼
+          <input id="reg-invite" type="text" placeholder="由管理員產生" autocomplete="off">
+        </label>
+        <label>裝置名稱（選填）
+          <input id="reg-label" type="text" placeholder="MacBook Pro" maxlength="60">
+        </label>
+        <button id="btn-register" class="btn">註冊 Passkey</button>
+      </details>
+    </div>
+  </section>
+
+  <!-- 已登入 -->
+  <section id="view-app" class="hidden">
+    <div class="card">
+      <div class="row between">
+        <h2>新建 Session</h2>
+        <span class="muted small" id="limits"></span>
+      </div>
+      <div class="row wrap">
+        <input id="new-label" type="text" placeholder="標籤（只你看得見，選填）" maxlength="120">
+        <label class="chk"><input id="new-burn" type="checkbox"> 讀後即毀</label>
+        <label class="chk hidden" id="plain-row"><input id="new-plain" type="checkbox"> 明文模式（可純 curl，放棄零知識）</label>
+        <button id="btn-new" class="btn primary">開新 Session</button>
+      </div>
+      <p id="app-msg" class="msg"></p>
+    </div>
+
+    <div id="sessions"></div>
+    <p id="empty" class="muted center">目前沒有進行中的 session。</p>
+
+    <div class="card">
+      <details>
+        <summary>我的 Passkey 裝置</summary>
+        <div id="creds"></div>
+        <button id="btn-add-cred" class="btn ghost">新增這台裝置</button>
+      </details>
+    </div>
+  </section>
+</main>
+
+<template id="tpl-session">
+  <div class="card session">
+    <div class="row between">
+      <div>
+        <span class="cid mono"></span>
+        <span class="tag burn hidden">讀後即毀</span>
+        <span class="tag plain hidden">明文</span>
+        <span class="label muted"></span>
+      </div>
+      <div class="row">
+        <span class="ttl pill"></span>
+        <button class="btn danger small act-destroy">立即銷毀</button>
+      </div>
+    </div>
+    <div class="bar-thin"><div class="bar-fill"></div></div>
+
+    <div class="row wrap uploader">
+      <textarea class="in-text" rows="3" placeholder="貼上文字，加密後上傳"></textarea>
+      <div class="col">
+        <button class="btn act-add-text">加入文字</button>
+        <label class="btn ghost file-label">選擇檔案<input type="file" class="in-file" multiple hidden></label>
+      </div>
+    </div>
+
+    <ul class="items"></ul>
+
+    <div class="row wrap share">
+      <button class="btn act-token">產生取用連結</button>
+      <label class="chk">次數 <input class="in-uses" type="number" min="1" max="20" value="1"></label>
+    </div>
+    <div class="out hidden">
+      <label>分享連結（含解密金鑰，僅在 fragment，不會送到伺服器）
+        <textarea class="out-link mono" rows="2" readonly></textarea>
+      </label>
+      <label>給 VM / AI Agent 的指令
+        <textarea class="out-curl mono" rows="6" readonly></textarea>
+      </label>
+      <button class="btn ghost small act-copy-link">複製連結</button>
+      <button class="btn ghost small act-copy-curl">複製指令</button>
+    </div>
+  </div>
+</template>
+
+<script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,90 @@
+# VaporDrop 部署編排
+#
+# 設計要點：
+#   * redis 與密文儲存全部在 RAM（tmpfs），容器重啟即歸零。
+#   * 只有 /data（SQLite，內含 Passkey 憑證）是持久卷。
+#   * api 容器 read_only，非 root，禁止提權。
+#   * caddy 關閉 access log。
+#
+# 啟動： cp .env.example .env && 編輯 .env && docker compose up -d --build
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # 完全關閉持久化：無 RDB、無 AOF。內容不落磁碟。
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --maxmemory 256mb
+      --maxmemory-policy noeviction
+      --databases 1
+      --loglevel warning
+    tmpfs:
+      - /data:size=8m
+    networks: [vapor]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      BLOB_DIR: /vapor
+      DB_PATH: /data/vapor.db
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    tmpfs:
+      # 密文只存在 RAM。noexec/nosuid/nodev 防止上傳內容被當成可執行檔。
+      - /vapor:size=512m,mode=0700,uid=10001,gid=10001,noexec,nosuid,nodev
+      - /tmp:size=32m,mode=1777
+    volumes:
+      # 唯一持久資料：Passkey 憑證與邀請碼
+      - vapor-db:/data
+    networks: [vapor]
+    logging:
+      # 不保留應用輸出，避免任何意外洩漏
+      driver: "none"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/healthz')\""]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [api]
+    env_file: .env
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:${HTTP_PORT:-80}:80"
+      - "${BIND_ADDR:-0.0.0.0}:${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [vapor]
+    logging:
+      driver: "none"
+
+networks:
+  vapor:
+    driver: bridge
+
+volumes:
+  vapor-db:
+  caddy-data:
+  caddy-config:

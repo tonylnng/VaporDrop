@@ -1,0 +1,51 @@
+# VaporDrop 邊緣設定
+#
+# 兩個關鍵點：
+#   1. log 完全關閉（access log 是「不可追蹤」需求的最大破口）。
+#   2. request_body 上限與 api 端的 MAX_ITEM_BYTES 對齊。
+
+{
+	admin off
+	# 若使用 Cloudflare Tunnel 或 Tailscale，可改成 auto_https off
+	email {$ACME_EMAIL:admin@example.com}
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+{$SITE_ADDRESS:localhost} {
+	# 沒有 log 指令 = 不產生 access log。請勿為了 debug 而加回去。
+	log {
+		output discard
+	}
+
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+		-X-Powered-By
+	}
+
+	request_body {
+		max_size {$MAX_BODY_SIZE:34MB}
+	}
+
+	reverse_proxy api:8080 {
+		# 不轉發真實 IP 到應用層：應用只需要一個穩定的桶 key，不需要 IP 原文
+		header_up X-Forwarded-For "0.0.0.0"
+		header_up X-Real-IP "0.0.0.0"
+		flush_interval -1
+	}
+}
+
+# --- 純內網 / Tailscale 部署範例 -------------------------------------
+# 若只在 tailnet 內服務，把上面的 site block 換成：
+#
+# vapor.your-tailnet.ts.net {
+#     tls internal
+#     log { output discard }
+#     reverse_proxy api:8080
+# }
+#
+# 或直接不用 caddy，讓 tailscale serve 指向 api:8080。

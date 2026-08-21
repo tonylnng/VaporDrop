@@ -1,0 +1,8 @@
+-r app/requirements.txt
+# 已實測版本
+pytest==9.1.1
+fakeredis==2.37.1
+httpx==0.28.1
+cryptography>=42
+# 本機開發伺服器與截圖檢查（選用）
+# playwright>=1.49

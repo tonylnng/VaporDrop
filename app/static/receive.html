@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>VaporDrop · 取用</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">Vapor<span>Drop</span></div>
+  <div class="bar-right">
+    <span id="ttl" class="pill"></span>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <div class="row between">
+      <h2>取用內容</h2>
+      <span class="mono small muted" id="cid"></span>
+    </div>
+    <p id="msg" class="msg"></p>
+    <p id="burn-note" class="msg warn hidden">此 session 為讀後即毀：下載後內容立即消失，無法重讀。</p>
+    <ul id="items"></ul>
+  </section>
+
+  <section class="card">
+    <details>
+      <summary>命令行取用</summary>
+      <p class="muted small">若接收方是 VM 或 AI Agent，用下面的方式更直接。金鑰與 token 都不會出現在伺服器端網址。</p>
+      <textarea id="cli" class="mono" rows="6" readonly></textarea>
+    </details>
+  </section>
+</main>
+
+<script type="module" src="/static/js/receive.js"></script>
+</body>
+</html>

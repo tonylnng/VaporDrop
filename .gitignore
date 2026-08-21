@@ -1,0 +1,24 @@
+# 環境與機密
+.env
+*.pem
+*.key
+
+# 資料（永遠不該進 repo）
+*.db
+*.db-journal
+/vapor/
+blobs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# OS / 編輯器
+.DS_Store
+.idea/
+.vscode/
