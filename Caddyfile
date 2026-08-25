@@ -2,7 +2,7 @@
 #
 # 兩個關鍵點：
 #   1. log 完全關閉（access log 是「不可追蹤」需求的最大破口）。
-#   2. request_body 上限與 api 端的 MAX_ITEM_BYTES 對齊。
+#   2. request_body 上限與 vapordrop-api 端的 MAX_ITEM_BYTES 對齊。
 
 {
 	admin off
@@ -31,7 +31,7 @@
 		max_size {$MAX_BODY_SIZE:34MB}
 	}
 
-	reverse_proxy api:8080 {
+	reverse_proxy vapordrop-api:8080 {
 		# 不轉發真實 IP 到應用層：應用只需要一個穩定的桶 key，不需要 IP 原文
 		header_up X-Forwarded-For "0.0.0.0"
 		header_up X-Real-IP "0.0.0.0"
@@ -45,7 +45,7 @@
 # vapor.your-tailnet.ts.net {
 #     tls internal
 #     log { output discard }
-#     reverse_proxy api:8080
+#     reverse_proxy vapordrop-api:8080
 # }
 #
-# 或直接不用 caddy，讓 tailscale serve 指向 api:8080。
+# 或直接不用 vapordrop-caddy，讓 tailscale serve 指向 vapordrop-api:8080。

@@ -42,11 +42,12 @@ graph TB
         WC --> SS
     end
 
-    subgraph Edge["邊緣層 · Docker"]
-        CADDY["Caddy<br/>自動 TLS · HSTS · CSP<br/>access_log OFF"]
+    subgraph Host["海外 Ubuntu VM · Public IP · Docker Compose 專案 vapordrop"]
+    subgraph Edge["邊緣層 · vapordrop-caddy"]
+        CADDY["Caddy :443<br/>Let's Encrypt 自動 TLS<br/>HSTS · access_log OFF"]
     end
 
-    subgraph App["應用層 · Docker"]
+    subgraph App["應用層 · vapordrop-api（read_only · uid 10001）"]
         API["FastAPI<br/>無 request log"]
         AUTH["Auth 模組<br/>py_webauthn"]
         SESS["Session 模組<br/>server-side cookie session"]
@@ -59,9 +60,11 @@ graph TB
         API --> RL
     end
 
-    subgraph Store["儲存層 · 全部易失"]
-        REDIS[("Redis<br/>appendonly no · save 空<br/>maxmemory-policy noeviction<br/>全部 key 帶 TTL")]
-        TMPFS[["tmpfs /vapor<br/>RAM 檔案系統<br/>只存密文分塊"]]
+    subgraph Store["儲存層"]
+        REDIS[("vapordrop-redis<br/>appendonly no · save 空<br/>noeviction · 全部 key 帶 TTL<br/>易失")]
+        TMPFS[["tmpfs /vapor（RAM）<br/>只存密文分塊<br/>易失"]]
+        SQLITE[("vapordrop-db 卷<br/>SQLite<br/>Passkey 憑證與邀請碼<br/>唯一持久資料")]
+    end
     end
 
     subgraph Consumer["消費端"]
@@ -72,6 +75,7 @@ graph TB
     Client -- "HTTPS · 只傳密文" --> CADDY
     CADDY --> API
     AUTH <--> REDIS
+    AUTH <--> SQLITE
     SESS <--> REDIS
     BLOB <--> REDIS
     BLOB <--> TMPFS
@@ -82,6 +86,7 @@ graph TB
     AGENT -- "GET /s/{id}/raw" --> CADDY
 
     style Client fill:#e8f4ff,stroke:#2b6cb0
+    style Host fill:#f7fafc,stroke:#4a5568
     style Store fill:#fff5e6,stroke:#b7791f
     style Consumer fill:#eaffea,stroke:#2f855a
 ```
@@ -376,7 +381,7 @@ graph TB
 sequenceDiagram
     actor T as Tony · MacBook
     participant V as VaporDrop
-    participant M as GB10 上的 Agent
+    participant M as 隔離 VM / 工作站上的 Agent
 
     T->>V: 開 session，貼 8000 行 log + 分析指令
     V-->>T: cid + token + curl 指令
@@ -409,35 +414,61 @@ sequenceDiagram
 
 ## 7. 部署藍圖
 
-### 7.1 容器拓撲
+### 7.1 部署拓撲
+
+部署目標是一部**位於海外、具 Public IP 的 Ubuntu VM**，單機 Docker Compose 即可，不需要 GPU、不需要 Kubernetes。所有 Docker 物件統一以 `vapordrop` 前綴命名。
 
 ```mermaid
 graph LR
-    subgraph Host["Ubuntu Host · Docker Compose"]
-        direction TB
-        C["caddy<br/>:443<br/>read-only"]
-        A["api · FastAPI<br/>uvicorn --no-access-log<br/>tmpfs: /vapor 512m"]
-        R["redis:7-alpine<br/>--save '' --appendonly no<br/>--maxmemory 256mb"]
-        C --> A
-        A --> R
-    end
-    TS["tailscale sidecar<br/>可選：只開 tailnet"] --- C
-    CF["cloudflared<br/>可選：公網入口"] --- C
+    U[/使用者瀏覽器/] -->|HTTPS 443| FW
+    G[/VM · AI Agent/] -->|HTTPS 443| FW
 
-    style Host fill:#f7fafc,stroke:#4a5568
+    subgraph VM["海外 Ubuntu VM · Public IP"]
+        FW["ufw / 雲端安全群組<br/>只開 22 · 80 · 443"]
+        subgraph P["Docker Compose 專案：vapordrop（網路 vapordrop-net）"]
+            direction TB
+            C["vapordrop-caddy<br/>:80 · :443<br/>自動 TLS · 無日誌"]
+            A["vapordrop-api<br/>FastAPI · read_only · uid 10001<br/>tmpfs /vapor 512m"]
+            R["vapordrop-redis<br/>--save '' --appendonly no<br/>--maxmemory 256mb"]
+            D[("vapordrop-db 卷<br/>SQLite · 唯一持久資料")]
+            C -->|reverse_proxy| A
+            A --> R
+            A --> D
+        end
+        FW --> C
+    end
+
+    style VM fill:#f7fafc,stroke:#4a5568
+    style P fill:#eef6ff,stroke:#2b6cb0
 ```
+
+**選用強化**（見 [docs/DEPLOY.md](docs/DEPLOY.md)）：若不想把 443 曝在公網，可把 `BIND_ADDR` 綁 `127.0.0.1`，改以 Tailscale tailnet 或 Cloudflare Tunnel 作為唯一入口；程式碼不需改動。
+
+**Docker 命名對照**
+
+| 類型 | 名稱 |
+|------|------|
+| Compose 專案 | `vapordrop` |
+| 服務 / 容器 | `vapordrop-api`、`vapordrop-redis`、`vapordrop-caddy` |
+| 自建映像 | `vapordrop-api:latest` |
+| 網路 | `vapordrop-net` |
+| 持久卷 | `vapordrop-db`（唯一需備份）、`vapordrop-caddy-data`、`vapordrop-caddy-config` |
 
 ### 7.2 關鍵設定（節錄）
 
 ```yaml
 # docker-compose.yml 要點
+name: vapordrop
 services:
-  redis:
+  vapordrop-redis:
+    container_name: vapordrop-redis
     command: >
       redis-server --save "" --appendonly no
       --maxmemory 256mb --maxmemory-policy noeviction
     tmpfs: [/data]
-  api:
+  vapordrop-api:
+    container_name: vapordrop-api
+    image: vapordrop-api:latest
     read_only: true
     tmpfs:
       - /vapor:size=512m,mode=1700,noexec,nosuid,nodev
@@ -451,7 +482,10 @@ services:
       MAX_SESSION_BYTES: 134217728    # 128 MB
       MAX_ACTIVE_SESSIONS_PER_USER: 5
       ALLOW_SERVER_SIDE_PLAIN: "false"
+      REDIS_URL: redis://vapordrop-redis:6379/0
       RP_ID: vapor.example.com
+    volumes: [vapordrop-db:/data]
+    networks: [vapordrop-net]
 ```
 
 ### 7.3 資料分層與 Key 設計

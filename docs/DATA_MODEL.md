@@ -33,7 +33,7 @@ graph TB
 
 ## 1. 持久層：SQLite
 
-檔案 `/data/vapor.db`（compose volume `vapor-db`）。完整定義見 [`schema.sql`](../schema.sql)。
+檔案 `/data/vapor.db`（compose volume `vapordrop-db`）。完整定義見 [`schema.sql`](../schema.sql)。
 
 | 表 | 欄位 | 用途 |
 |----|------|------|

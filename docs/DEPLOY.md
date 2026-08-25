@@ -42,7 +42,7 @@ ACME_EMAIL=you@example.com
 
 ```bash
 docker compose up -d --build
-docker compose ps          # 三個容器都應為 running / healthy
+docker compose ps          # vapordrop-redis / vapordrop-api / vapordrop-caddy 皆應 running / healthy
 ```
 
 ## 4. 建立第一個帳號
@@ -53,13 +53,13 @@ docker compose ps          # 三個容器都應為 running / healthy
 
 ```bash
 sed -i 's/^ALLOW_FIRST_USER_BOOTSTRAP=.*/ALLOW_FIRST_USER_BOOTSTRAP=false/' .env
-docker compose up -d api
+docker compose up -d vapordrop-api
 ```
 
 ## 5. 邀請其他人
 
 ```bash
-docker compose exec api python -m app.cli invite --note "Ian" --base-url https://vapor.example.com
+docker compose exec vapordrop-api python -m app.cli invite --note "Ian" --base-url https://vapor.example.com
 ```
 
 輸出的註冊連結 15 分鐘內有效，一次性。請用安全通道遞送。
@@ -79,12 +79,12 @@ docker compose exec api python -m app.cli invite --note "Ian" --base-url https:/
 docker compose logs --since 10m | grep -iE "GET|POST|/s/" && echo "❌ 有日誌洩漏" || echo "✓ 無請求日誌"
 
 # Redis 必須沒有持久化
-docker compose exec redis redis-cli CONFIG GET appendonly   # 應為 no
-docker compose exec redis redis-cli CONFIG GET save         # 應為空
+docker compose exec vapordrop-redis redis-cli CONFIG GET appendonly   # 應為 no
+docker compose exec vapordrop-redis redis-cli CONFIG GET save         # 應為空
 
 # 每個 key 都必須有 TTL
-docker compose exec redis redis-cli --scan | while read k; do
-  echo "$k $(docker compose exec -T redis redis-cli TTL "$k")"
+docker compose exec vapordrop-redis redis-cli --scan | while read k; do
+  echo "$k $(docker compose exec -T vapordrop-redis redis-cli TTL "$k")"
 done
 ```
 
@@ -138,14 +138,14 @@ cloudflared tunnel run --url http://127.0.0.1:80 vapordrop
 
 | 目的 | 指令 |
 |------|------|
-| 列出用戶與裝置 | `docker compose exec api python -m app.cli users` |
-| 產生邀請碼 | `docker compose exec api python -m app.cli invite` |
-| 停用某人 | `docker compose exec api python -m app.cli disable <handle>` |
-| 緊急清空所有內容 | `docker compose exec api python -m app.cli purge && docker compose exec redis redis-cli FLUSHDB` |
+| 列出用戶與裝置 | `docker compose exec vapordrop-api python -m app.cli users` |
+| 產生邀請碼 | `docker compose exec vapordrop-api python -m app.cli invite` |
+| 停用某人 | `docker compose exec vapordrop-api python -m app.cli disable <handle>` |
+| 緊急清空所有內容 | `docker compose exec vapordrop-api python -m app.cli purge && docker compose exec vapordrop-redis redis-cli FLUSHDB` |
 | 更新版本 | `git pull && docker compose up -d --build` |
 | 完全銷毀（含憑證） | `docker compose down -v` |
 
-備份只需要 `vapor-db` volume（Passkey 憑證）。內容永遠沒有備份 —— 這是設計目標，不是缺陷。
+備份只需要 `vapordrop-db` volume（Passkey 憑證）。內容永遠沒有備份 —— 這是設計目標，不是缺陷。
 
 ---
 
@@ -165,3 +165,23 @@ cloudflared tunnel run --url http://127.0.0.1:80 vapordrop
 
 **想加 access log 來 debug**
 不要。若真的必要，請只在臨時排錯期間加上，並在完成後立即移除；README 的驗收清單會因此不通過。
+
+---
+
+## 附錄：Docker 命名對照
+
+所有 Docker 物件統一以 `vapordrop` 為前綴，方便在共用主機上辨識與整批操作。
+
+| 類型 | 名稱 |
+|------|------|
+| Compose 專案 | `vapordrop` |
+| 服務 / 容器 | `vapordrop-api`、`vapordrop-redis`、`vapordrop-caddy` |
+| 映像（自建） | `vapordrop-api:latest` |
+| 網路 | `vapordrop-net` |
+| 持久卷 | `vapordrop-db`（唯一需備份）、`vapordrop-caddy-data`、`vapordrop-caddy-config` |
+
+```bash
+docker ps     --filter name=vapordrop
+docker volume ls --filter name=vapordrop
+docker network ls --filter name=vapordrop
+```
