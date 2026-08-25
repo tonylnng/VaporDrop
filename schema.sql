@@ -51,9 +51,35 @@ CREATE TABLE IF NOT EXISTS invites (
 CREATE INDEX IF NOT EXISTS idx_invites_expires ON invites(expires_at);
 
 -- ---------------------------------------------------------------
+-- 緊急登入碼（break-glass）：Google 服務中斷或 OAuth client 被停用時的逃生門
+-- 只存 SHA-256 雜湊；原文只在 CLI 產生的那一瞬間印在終端
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS rescue_codes (
+    code_hash   TEXT PRIMARY KEY,              -- sha256(原文碼)
+    uid         TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,              -- 預設 600 秒
+    used_at     INTEGER,                       -- 非 NULL 即已用，不可重用
+    FOREIGN KEY (uid) REFERENCES users(uid) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_rescue_expires ON rescue_codes(expires_at);
+
+-- ---------------------------------------------------------------
+-- Google 登入如何對應到 users（重要）
+-- ---------------------------------------------------------------
+--   uid = HMAC-SHA256(UID_PEPPER, 小寫 email) 的前 32 個 hex 字
+--   → 同一 email 永遠對到同一列，但資料庫裡沒有 email 原文
+--   → handle 預設為 g-<uid 前 10 位>，完全不可辨識；
+--     若 STORE_EMAIL_HANDLE=true 則改用 email 的 @ 前半部（好認，但留下部分個資）
+--   → Google 登入的用戶在 credentials 表裡沒有任何列，除非他另外加註 Passkey
+
+-- ---------------------------------------------------------------
 -- 刻意不建立的表（設計決定，不是遺漏）
 -- ---------------------------------------------------------------
 --   sessions      -> 只存在 Redis，帶 TTL，重啟即失
 --   content       -> 只存在 Redis（metadata）+ tmpfs（密文），10 分鐘蒸發
 --   access_log    -> 不存在。無日誌是硬需求
 --   audit_trail   -> 不存在。若日後合規需要，只可記「無內容」的計數
+--   emails        -> 不存在。Google 登入只存 HMAC 後的 uid，不存 email
+--   oauth_tokens  -> 不存在。access / refresh token 驗證完即丟，一律不保留

@@ -4,3 +4,4 @@ uvicorn[standard]==0.52.4
 redis==8.1.0
 webauthn==3.0.0
 pydantic==2.12.5
+httpx==0.28.1

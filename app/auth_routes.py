@@ -65,6 +65,7 @@ async def auth_state(request: Request):
         "authenticated": uid is not None,
         "handle": handle,
         "bootstrap": users == 0 and config.ALLOW_FIRST_USER_BOOTSTRAP,
+        "google": config.google_enabled(),
         "idle_timeout": config.IDLE_TIMEOUT,
         "content_ttl": config.CONTENT_TTL,
         "allow_plain": config.ALLOW_SERVER_SIDE_PLAIN,

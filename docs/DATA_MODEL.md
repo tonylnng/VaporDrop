@@ -8,17 +8,21 @@ graph TB
         U[users]
         C[credentials<br/>Passkey 公鑰]
         I[invites]
+        RC["rescue_codes<br/>只存 SHA-256 雜湊"]
     end
     subgraph V["揮發層　Redis（--save '' --appendonly no）"]
         S["auth:{sid}<br/>登入 session"]
         M["blob:{cid}:meta / :items<br/>內容索引"]
         T["tok:{token}<br/>一次性取用票"]
         F["chal:*　WebAuthn challenge"]
+        G["goog:{state}<br/>nonce + code_verifier"]
     end
     subgraph B["揮發層　tmpfs /vapor（RAM）"]
         BL["{cid}/{iid}.bin<br/>AES-256-GCM 密文"]
     end
     C -.驗證登入.-> S
+    G -.驗證登入.-> S
+    RC -.破窗登入.-> S
     S -.擁有者.-> M
     M -.指向.-> BL
     T -.授權讀取.-> M
@@ -37,9 +41,23 @@ graph TB
 
 | 表 | 欄位 | 用途 |
 |----|------|------|
-| `users` | `uid` PK、`handle` UNIQUE、`created_at`、`disabled` | 帳號。`handle` 只用於顯示與 Passkey 註冊，不含 email/電話 |
+| `users` | `uid` PK、`handle` UNIQUE、`created_at`、`disabled` | 帳號。`handle` 只用於顯示，不含 email/電話。Google 登入時 `uid = HMAC-SHA256(UID_PEPPER, 小寫 email)[:32]` |
 | `credentials` | `credential_id` PK、`uid`、`public_key` BLOB、`sign_count`、`transports`、`label`、`created_at`、`last_used_at` | WebAuthn 公鑰。私鑰永遠在使用者裝置的安全元件內，伺服器拿不到 |
 | `invites` | `code` PK、`created_at`、`expires_at`、`used_at`、`used_by`、`note` | 一次性註冊邀請，預設 15 分鐘過期 |
+| `rescue_codes` | `code_hash` PK、`uid`、`created_at`、`expires_at`、`used_at` | 緊急登入碼。**只存 `SHA-256(原文)`**，單次使用，預設 600 秒；sweeper 會清除過期列 |
+
+### Google 帳號如何對應到 `users`
+
+```
+uid = HMAC-SHA256(UID_PEPPER, lowercase(email)).hexdigest()[:32]
+```
+
+- 同一個 email 永遠推導出同一個 `uid` → 第二次登入自動對到同一列，不會產生重複帳號。
+- 資料庫**沒有 email 原文**，也沒有可反解的密文——`UID_PEPPER` 只是 HMAC 的 key，不是加密金鑰，這是單向的。
+- 管理員要查「這個 email 是哪一列」時用 `python -m app.cli whois <email>`：它是**重算**同一個 HMAC，不是解密。
+- `handle` 預設 `g-<uid[:10]>`（例：`g-3f9a1c2b7d`）。設 `STORE_EMAIL_HANDLE=true` 會改用 email 的 `@` 前半部，好認但等於在 DB 留下部分個資。handle 撞名時自動加數字後綴。
+- **`UID_PEPPER` 是身份的一部分**：改了 pepper，所有人的 `uid` 都會變，等於全部重新開帳號（Passkey 綁定也會失效）。請與資料庫一起備份。
+- Google 登入的用戶在 `credentials` 表裡沒有任何列，除非他另外加註一把 Passkey。
 
 **故意不存在的表**（schema.sql 內有註記，避免日後有人「順手補上」）：
 
@@ -47,6 +65,8 @@ graph TB
 - `contents` / `items` — 內容索引只在 Redis
 - `access_log` / `audit_trail` — 不記錄誰在何時取用了什麼
 - `shares` — 分享連結不落地，token 只在 Redis
+- `emails` — Google 登入只存 HMAC 後的 `uid`，email 原文從不寫磁碟
+- `oauth_tokens` — Google 的 access / refresh token 驗完即丟，一律不保留（只要 `openid email` 兩個 scope）
 
 `last_used_at` 是唯一帶時間痕跡的欄位，精度到秒、只覆寫不累積，用途是讓你發現「某把不該再用的 Passkey 還在被用」。若連這個都不想要，把 `db.touch_credential` 改成 no-op 即可。
 
@@ -60,6 +80,7 @@ graph TB
 |-----|------|-------------|-----|------|
 | `auth:{sid}` | hash | `uid`、`created_at`、`last_seen` | `IDLE_TIMEOUT`（1800s，每次請求滑動續期） | 登入 session。cookie 只帶 `sid` |
 | `chal:reg:{flow}` / `chal:auth:{flow}` | string | WebAuthn challenge（含待註冊 handle / invite） | `FLOW_TTL`（300s） | 取用即刪（`flow_take` = GET+DEL），防重放 |
+| `goog:{state}` | string | Google 登入流程的 `nonce` 與 `code_verifier` | `FLOW_TTL`（300s） | 取用即刪。放 Redis 而非 cookie，因為 Google 轉回時是跨站導覽，`SameSite=Strict` 的 cookie 不會被送出；同時提供登入 CSRF 防護 |
 | `blob:{cid}:meta` | hash | `owner`、`label`（密文）、`created_at`、`expires_at`、`bytes`、`burn`、`plain` | `CONTENT_TTL`（600s，**永不續期**） | session 中介資料 |
 | `blob:{cid}:items` | hash | `iid` → JSON（`name` 密文、`kind`、`size`、`created_at`） | 對齊 meta 的剩餘 TTL | 項目索引 |
 | `tok:{token}` | hash | `cid`、`uses` | `min(剩餘內容 TTL, 請求值)` | 一次性/限次取用票，`token_spend` 以 `HINCRBY` 原子扣減 |

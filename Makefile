@@ -2,15 +2,15 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose
 
-.PHONY: help up down restart build logs ps test dev invite users purge verify nuke
+.PHONY: help up down restart build logs ps test dev invite users whois rescue purge verify nuke pepper
 
 help: ## 顯示可用指令
-	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
+	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-9s\033[0m %s\n", $$1, $$2}'
 
 up: ## 建置並啟動全部服務
 	$(COMPOSE) up -d --build
 
-down: ## 停止服務（保留 Passkey 資料）
+down: ## 停止服務（保留帳號與 Passkey 資料）
 	$(COMPOSE) down
 
 restart: ## 重啟 vapordrop-api（會清掉所有內容與登入狀態）
@@ -37,6 +37,15 @@ invite: ## 產生一次性註冊邀請連結
 users: ## 列出帳號與 Passkey 裝置
 	$(COMPOSE) exec vapordrop-api python -m app.cli users
 
+whois: ## 由 email 反查 uid（make whois EMAIL=you@gmail.com）
+	$(COMPOSE) exec vapordrop-api python -m app.cli whois "$(EMAIL)"
+
+rescue: ## 產生一次性緊急登入連結（make rescue HANDLE=g-xxxxxxxxxx）
+	$(COMPOSE) exec vapordrop-api python -m app.cli rescue --handle "$(HANDLE)" --create --base-url "https://$${SITE_ADDRESS:-localhost}"
+
+pepper: ## 產生 UID_PEPPER（只在初次部署用，之後不可更改）
+	@openssl rand -hex 32
+
 purge: ## 緊急清空所有內容（不影響帳號）
 	$(COMPOSE) exec vapordrop-api python -m app.cli purge
 	$(COMPOSE) exec vapordrop-redis redis-cli FLUSHDB
@@ -44,5 +53,5 @@ purge: ## 緊急清空所有內容（不影響帳號）
 verify: ## 部署後驗收（make verify URL=https://your-domain）
 	./scripts/verify.sh "$(URL)"
 
-nuke: ## 銷毀一切，包含 Passkey 憑證與 TLS 憑證
+nuke: ## 銷毀一切，包含帳號、Passkey 憑證與 TLS 憑證
 	$(COMPOSE) down -v

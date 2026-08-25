@@ -11,7 +11,7 @@
 
 | # | 目標 | 具體要求 |
 |---|------|----------|
-| G1 | 安全且方便的登入 | Passkey / WebAuthn，一次註冊，之後 Touch ID 一觸即入；無密碼、無郵件、抗釣魚 |
+| G1 | 安全且方便的登入 | **Google 登入（OIDC Authorization Code + PKCE）為主**：白名單內的 Google 帳號一鍵進入，無密碼、無郵件驗證、無需生物認證；Passkey / WebAuthn 保留為選用的抗釣魚路徑，另有 CLI 產生的一次性緊急登入連結作逃生門 |
 | G2 | Session 化暫存 | 登入後可開新 session，貼文字或上傳檔案，內容集中於該 session |
 | G3 | 10 分鐘蒸發 | 每個 content session TTL = 600 秒，到期自動且不可回復地刪除 |
 | G4 | 不留日誌、不可追蹤 | 無 access log、不記 IP/UA、無 analytics、無持久化儲存 |
@@ -35,7 +35,7 @@ graph TB
     subgraph Client["瀏覽器 · 唯一持有明文的地方"]
         UI["SPA · vanilla JS"]
         WC["WebCrypto<br/>AES-256-GCM 加解密"]
-        PK["Passkey / Platform Authenticator<br/>Touch ID · Windows Hello"]
+        PK["Passkey（選用）<br/>Touch ID · Windows Hello"]
         SS["sessionStorage<br/>只存解密金鑰 · 關閉即失"]
         UI --> WC
         UI --> PK
@@ -49,7 +49,7 @@ graph TB
 
     subgraph App["應用層 · vapordrop-api（read_only · uid 10001）"]
         API["FastAPI<br/>無 request log"]
-        AUTH["Auth 模組<br/>py_webauthn"]
+        AUTH["Auth 模組<br/>Google OIDC + py_webauthn"]
         SESS["Session 模組<br/>server-side cookie session"]
         BLOB["Blob 模組<br/>密文讀寫"]
         SWEEP["Sweeper<br/>每 30s 掃孤兒檔"]
@@ -63,8 +63,12 @@ graph TB
     subgraph Store["儲存層"]
         REDIS[("vapordrop-redis<br/>appendonly no · save 空<br/>noeviction · 全部 key 帶 TTL<br/>易失")]
         TMPFS[["tmpfs /vapor（RAM）<br/>只存密文分塊<br/>易失"]]
-        SQLITE[("vapordrop-db 卷<br/>SQLite<br/>Passkey 憑證與邀請碼<br/>唯一持久資料")]
+        SQLITE[("vapordrop-db 卷<br/>SQLite<br/>uid（HMAC）· Passkey 憑證<br/>邀請碼 · 緊急碼雜湊<br/>唯一持久資料 · 不存 email")]
     end
+    end
+
+    subgraph IdP["外部身份提供者"]
+        GOOG["Google OIDC<br/>accounts.google.com<br/>只知登入事件 · 不見內容"]
     end
 
     subgraph Consumer["消費端"]
@@ -76,6 +80,9 @@ graph TB
     CADDY --> API
     AUTH <--> REDIS
     AUTH <--> SQLITE
+    UI -- "轉向登入（前端不載入 Google JS）" --> GOOG
+    GOOG -- "code + state 轉回 /auth/google/callback" --> CADDY
+    AUTH -- "伺服器對伺服器換 id_token<br/>client_secret + PKCE" --> GOOG
     SESS <--> REDIS
     BLOB <--> REDIS
     BLOB <--> TMPFS
@@ -89,6 +96,7 @@ graph TB
     style Host fill:#f7fafc,stroke:#4a5568
     style Store fill:#fff5e6,stroke:#b7791f
     style Consumer fill:#eaffea,stroke:#2f855a
+    style IdP fill:#f0e6ff,stroke:#6b46c1
 ```
 
 ### 2.2 信任邊界與資料形態
@@ -113,7 +121,42 @@ flowchart LR
 
 ## 3. 核心流程
 
-### 3.1 Passkey 註冊（一次性，需 Bootstrap Token）
+### 3.1 Google 登入（主要路徑 · Authorization Code + PKCE）
+
+前端只是一個 `<a href="/auth/google/start">`，**不載入任何 Google JavaScript SDK**，因此 CSP 維持 `script-src 'self'`。
+`state` / `nonce` / `code_verifier` 存在 Redis（單次使用、300 秒），不放 cookie——因為 Google 轉回時是跨站導覽，`SameSite=Strict` 的 cookie 不會被送出；這同時提供登入 CSRF 防護。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 用戶
+    participant B as 瀏覽器
+    participant A as FastAPI
+    participant R as Redis
+    participant G as Google
+    participant D as SQLite
+
+    U->>B: 點「用 Google 登入」
+    B->>A: GET /auth/google/start
+    A->>R: 存 state · nonce · code_verifier<br/>單次使用 · 300s
+    A-->>B: 303 → accounts.google.com<br/>scope=openid email · code_challenge S256
+    B->>G: 選擇帳號（Google 端完成認證）
+    G-->>B: 303 → /auth/google/callback?code&state
+    B->>A: GET /auth/google/callback
+    A->>R: 取出並刪除 state（重放即失敗）
+    A->>G: POST /token（伺服器對伺服器）<br/>code + code_verifier + client_secret
+    G-->>A: id_token（含 email · nonce）
+    A->>A: 驗 iss · aud · exp/iat · nonce<br/>email_verified · 白名單
+    A->>A: uid = HMAC-SHA256(UID_PEPPER, email)[:32]
+    A->>D: ensure_user(uid)<br/>只寫 uid 與不可辨識的 handle
+    A->>R: SET auth:{sid} {uid} EX 1800
+    A-->>B: Set-Cookie: vsid=…<br/>HttpOnly · Secure · SameSite=Strict<br/>303 → /
+```
+
+> **email 不落地**：`uid = HMAC-SHA256(UID_PEPPER, 小寫 email)` 前 32 個 hex 字，`handle` 預設為 `g-<uid 前 10 位>`。同一 email 永遠對到同一列，但資料庫裡沒有 email 原文，磁碟被扣押也看不出誰用過。管理員需反查時用 `python -m app.cli whois <email>`（單向重算，非解密）。
+> 失敗一律 `303 → /?e=<code>`（`denied` / `state` / `token` / `email` / `nolist` / `rescue`），伺服器不回傳任何可用於帳號枚舉的細節，前端才把代碼翻成中文訊息。
+
+### 3.2 Passkey 註冊（選用 · 一次性，需 Bootstrap Token）
 
 ```mermaid
 sequenceDiagram
@@ -139,7 +182,7 @@ sequenceDiagram
     A-->>B: 201 Created
 ```
 
-### 3.2 登入（Passkey Assertion）
+### 3.3 登入（Passkey Assertion，選用替代路徑）
 
 ```mermaid
 sequenceDiagram
@@ -161,7 +204,7 @@ sequenceDiagram
     B->>B: 啟動 idle timer 30 分鐘
 ```
 
-### 3.3 開 Session 並上傳（零知識）
+### 3.4 開 Session 並上傳（零知識）
 
 ```mermaid
 sequenceDiagram
@@ -187,7 +230,7 @@ sequenceDiagram
     B->>U: 顯示分享連結 https://host/s/{cid}#k=BASE64URL<br/>+ 一次性 token · 倒數 10:00
 ```
 
-### 3.4 Agent / VM 取用
+### 3.5 Agent / VM 取用
 
 ```mermaid
 sequenceDiagram
@@ -212,7 +255,7 @@ sequenceDiagram
 
 > **給 Agent 的極簡模式**：若接收方在同一 Tailscale tailnet 內（傳輸已加密且已認證），可用 `?mode=plain` 開關由伺服器端持有金鑰、直接回純文字，換取「一條 curl 搞定」的便利。此模式犧牲零知識性質，**預設關閉**，需在設定中明確啟用。
 
-### 3.5 Session 生命週期狀態機
+### 3.6 Session 生命週期狀態機
 
 ```mermaid
 stateDiagram-v2
@@ -235,7 +278,7 @@ stateDiagram-v2
     end note
 ```
 
-### 3.6 登出與閒置逾時
+### 3.7 登出與閒置逾時
 
 ```mermaid
 flowchart TD
@@ -264,7 +307,9 @@ flowchart TD
 
 | 功能 | 說明 |
 |------|------|
-| Passkey 登入 / 註冊 | 一次註冊，多裝置可各自註冊；支援多把 credential |
+| Google 登入 | 白名單內的 Google 帳號一鍵登入；伺服器不保存 email 原文 |
+| Passkey 登入 / 註冊（選用） | 一次註冊，多裝置可各自註冊；支援多把 credential；適合抗釣魚或不想依賴 Google 的場合 |
+| 緊急登入連結 | Google 服務中斷時，管理員用 CLI 產生一次性連結（預設 10 分鐘、用畢即失效） |
 | 新建 Session | 一鍵開 session，顯示 10 分鐘倒數 |
 | 貼文字 | 大段文字直接貼上，自動加密；支援語法無關的純文字 |
 | 上傳檔案 | 多檔上傳、分塊加密；單檔上限與 session 總量上限可設 |
@@ -284,14 +329,19 @@ flowchart TD
 | 無日誌模式 | Caddy `access_log off`、Uvicorn `--no-access-log`、app 層不記錄任何識別資訊 |
 | 無身份 Metrics | 僅暴露 `active_sessions`、`bytes_in_ram`、`sweeper_last_run` |
 | Rate Limit | in-memory token bucket，key 為 `HMAC(ip, 每日輪換 salt)`，不存 IP 原文 |
-| 重啟即全清 | 無持久化，容器重啟後除 Passkey 憑證外一切歸零 |
+| 重啟即全清 | 無持久化，容器重啟後除帳號列（uid）與 Passkey 憑證外一切歸零 |
+| 白名單準入 | `ALLOWED_EMAILS` 或 `ALLOWED_DOMAIN`；不在名單內不建立帳號、不回傳可枚舉的錯誤 |
 
 ### 4.3 API 表
 
 | Method | Path | 認證 | 說明 |
 |--------|------|------|------|
-| POST | `/auth/register/begin` \| `/finish` | invite code | Passkey 註冊 |
-| POST | `/auth/login/begin` \| `/finish` | — | Passkey 登入 |
+| GET | `/auth/google/start` | — | 轉向 Google（PKCE S256；未設定 client id 時為 404） |
+| GET | `/auth/google/callback` | state（Redis 單次） | 換 id_token、驗白名單、建 session cookie |
+| GET | `/auth/rescue?c=…` | 一次性緊急碼 | 破窗登入；SQLite 只存 SHA-256 雜湊 |
+| GET | `/auth/state` | — | 是否已登入、是否啟用 Google、TTL 等前端設定 |
+| POST | `/auth/register/begin` \| `/finish` | invite code | Passkey 註冊（選用） |
+| POST | `/auth/login/begin` \| `/finish` | — | Passkey 登入（選用） |
 | POST | `/auth/logout` | cookie | 登出並清除全部內容 |
 | POST | `/api/sessions` | cookie | 開新 content session |
 | PUT | `/api/sessions/{cid}/items` | cookie | 上傳密文 item |
@@ -319,10 +369,11 @@ graph TB
         T6["T6 中間人 / 網路竊聽"]
         T7["T7 日誌與 metadata 洩漏"]
         T8["T8 暴力枚舉 session ID"]
-        T9["T9 CSRF"]
+        T9["T9 登入 CSRF / 授權碼注入"]
+        T10["T10 IdP 依賴<br/>Google 停權或中斷"]
     end
     subgraph M["緩解措施"]
-        M1["Passkey origin 綁定<br/>無共享秘密可釣"]
+        M1["無密碼可釣<br/>Google 端 2FA + Passkey origin 綁定"]
         M2["伺服器只有密文<br/>金鑰在瀏覽器"]
         M3["tmpfs + Redis 無持久化<br/>TTL 硬上限 600s"]
         M4["token 一次性 + 10 分鐘<br/>金鑰在 fragment 需帶外遞送"]
@@ -330,7 +381,8 @@ graph TB
         M6["TLS 1.3 + HSTS<br/>可疊 Tailscale / CF Tunnel"]
         M7["全鏈路關 access log<br/>不記 IP/UA · Referrer-Policy no-referrer"]
         M8["128-bit CSPRNG ID<br/>+ rate limit + 恆定時間比較"]
-        M9["SameSite=Strict + Origin 檢查"]
+        M9["state 存 Redis 單次使用<br/>+ PKCE S256 + nonce<br/>SameSite=Strict + Origin 檢查"]
+        M10["Passkey 備援路徑<br/>+ CLI 一次性緊急登入連結"]
     end
     T1 --> M1
     T2 --> M2
@@ -341,6 +393,7 @@ graph TB
     T7 --> M7
     T8 --> M8
     T9 --> M9
+    T10 --> M10
 
     style M fill:#eaffea,stroke:#2f855a
     style T fill:#ffe6e6,stroke:#c53030
@@ -350,7 +403,10 @@ graph TB
 
 | 層面 | 控制 | 實作要點 |
 |------|------|----------|
-| 身份 | Passkey，`user_verification=required` | 驗 `origin`、`rp_id`、challenge 一次性、`sign_count` 遞增 |
+| 身份（主） | Google OIDC Authorization Code + PKCE | `id_token` 為伺服器對伺服器（帶 `client_secret`）取得；驗 `iss`/`aud`/`exp`/`iat`（±120s）/`nonce`/`email_verified`；`state` 與 `code_verifier` 存 Redis 單次使用 300s |
+| 身份（備） | Passkey，`user_verification=required` | 驗 `origin`、`rp_id`、challenge 一次性、`sign_count` 遞增 |
+| 個資最小化 | 資料庫不存 email | `uid = HMAC-SHA256(UID_PEPPER, 小寫 email)[:32]`；`handle` 預設 `g-xxxxxxxxxx`；無 `emails`、無 `oauth_tokens` 表，access/refresh token 驗完即丟 |
+| 準入（Google） | email 白名單或 Workspace 網域 | `ALLOWED_EMAILS` / `ALLOWED_DOMAIN`（同時作為 Google `hd` 參數）；未命中不建帳號 |
 | 準入 | 註冊需一次性 invite code | CLI 產生、15 分鐘 TTL、用後即毀 |
 | 會話 | Server-side session + 不可猜 cookie | `HttpOnly` `Secure` `SameSite=Strict`，不用 JWT 以保即時撤銷 |
 | 授權 | 每次操作驗 owner | `blob:{cid}:meta.owner == 當前 uid`；token 只綁單一 cid |
@@ -370,6 +426,9 @@ graph TB
 3. **接收端明文落地**：Agent 解密後如何處理明文，超出本系統控制；建議 Agent 端也寫入 tmpfs 並用完即刪。
 4. **無日誌 = 無取證**：出事時你也查不到誰做了什麼。這是刻意的取捨，請確認符合你的合規要求（HK PDPO 下屬「資料最小化」友好，但若需審計軌跡則需另議）。
 5. **瀏覽器記憶體**：明文與金鑰在頁面存活期間留在記憶體；建議用完即關分頁。
+6. **Google 知道你何時登入**：選了 Google 登入，就等於讓 Google 看見「這個帳號在這個時間登入了這個 OAuth client」。**Google 永遠看不到任何內容**（內容在瀏覽器就已加密），但登入事件本身不再是完全無痕。若這條也不能接受，把 `GOOGLE_CLIENT_ID` 留空、只用 Passkey。
+7. **id_token 未驗簽章（只驗 claims）**：`id_token` 是伺服器經 TLS 帶 `client_secret` 直接向 Google token endpoint 換來的，符合 [Google OIDC 文件](https://developers.google.com/identity/openid-connect/openid-connect)「透過直接 HTTPS 呼叫取得的 token 可略過本地驗簽」的說法。**但若日後改為接受前端傳來的 `id_token`，必須立即改成用 Google JWKS 驗 RS256 簽章**，否則等於任何人可自製身份。此決定已寫在 `app/google_auth.py` 的模組 docstring 內。
+8. **UID_PEPPER 遺失等同帳號全毀**：pepper 改變 → 所有 uid 改變 → 所有人變成全新帳號（內容本來就 10 分鐘蒸發，所以損失有限，但 Passkey 綁定會失效）。請與備份策略一起管理。
 
 ---
 
@@ -496,9 +555,10 @@ services:
 
 | 表 | 內容 |
 |----|------|
-| `users` | `uid`、`handle`、`created_at`、`disabled` |
+| `users` | `uid`（Google 登入時 = `HMAC(UID_PEPPER, email)[:32]`）、`handle`、`created_at`、`disabled` |
 | `credentials` | Passkey 公鑰、`sign_count`、`transports`、`label`、`last_used_at` |
 | `invites` | 一次性註冊碼、`expires_at`、`used_at`、`used_by` |
+| `rescue_codes` | 緊急登入碼的 **SHA-256 雜湊**、`expires_at`、`used_at`（單次使用） |
 
 **揮發層 — Redis（`--save "" --appendonly no`，每個 key 都必須有 TTL）**
 
@@ -515,7 +575,9 @@ services:
 
 速率限制桶在程序內記憶體，key 是 `HMAC(每日輪換 salt, IP)`，**不存 IP 原文**。
 
-刻意不存在：`sessions`、`contents`、`access_log`、`audit_trail`、`shares`。
+| `goog:{state}` | string | 300s | Google 登入流程的 `nonce` + `code_verifier`，取用即刪 |
+
+刻意不存在：`sessions`、`contents`、`access_log`、`audit_trail`、`shares`、`emails`、`oauth_tokens`。
 
 ### 7.4 專案結構
 
@@ -527,22 +589,25 @@ VaporDrop/
 ├── docker-compose.yml          redis（零持久化）+ api（read_only）+ caddy（無日誌）
 ├── Caddyfile                  TLS、request_body 上限、log discard
 ├── .env.example               所有可調參數（附中文說明）
-├── Makefile                   up / down / test / dev / invite / verify / nuke
+├── Makefile                   up / down / test / dev / invite / whois / rescue / verify / nuke
 ├── app/
 │   ├── main.py                FastAPI 入口、lifespan、sweeper、/healthz、/metrics
 │   ├── config.py              環境變數與預設值
-│   ├── db.py                  SQLite（Passkey 憑證、邀請碼）
+│   ├── db.py                  SQLite（帳號、Passkey 憑證、邀請碼、緊急碼）
 │   ├── store.py               Redis + tmpfs：TTL 不變量、覆寫抹除、sweeper
 │   ├── security.py            安全標頭、速率限制、session cookie、same-origin
 │   ├── auth_routes.py         WebAuthn 註冊 / 登入 / 裝置管理 / 登出
+│   ├── google_auth.py         Google OIDC（Authorization Code + PKCE）與緊急登入
 │   ├── session_routes.py      內容 session CRUD、token、/s/{cid}/raw
-│   ├── cli.py                 invite / users / disable / purge
+│   ├── cli.py                 invite / users / disable / purge / whois / rescue
 │   └── static/                index.html、receive.html、css、js（vcrypto/webauthn/api/app/receive）
 ├── scripts/
 │   ├── vapor_fetch.py         接收端 CLI（僅需 python3 + cryptography）
-│   └── verify.sh              部署後 15 項自動驗收
+│   └── verify.sh              部署後自動驗收（21 項；Google 未啟用時 16 項）
 ├── tools/devserver.py         本機開發用（fakeredis，免 Docker）
-├── tests/test_lifecycle.py    13 項安全與生命週期測試
+├── tests/
+│   ├── test_lifecycle.py      13 項安全與生命週期測試
+│   └── test_google_auth.py    17 項 Google 登入與緊急登入測試
 └── docs/
     ├── DEPLOY.md              部署步驟（寫給部署的人或 AI Agent）
     ├── DATA_MODEL.md          資料模型與密碼學細節
@@ -553,7 +618,10 @@ VaporDrop/
 
 | 方法 | 路徑 | 說明 |
 |------|------|------|
-| GET | `/auth/state` | 是否已登入、是否可 bootstrap |
+| GET | `/auth/google/start` | 轉向 Google（PKCE S256、`prompt=select_account`） |
+| GET | `/auth/google/callback` | 換 `id_token`、驗白名單、建立 session cookie |
+| GET | `/auth/rescue` | 一次性緊急登入連結（CLI 產生） |
+| GET | `/auth/state` | 是否已登入、是否啟用 Google、是否可 bootstrap |
 | POST | `/auth/register/begin` `/finish` | Passkey 註冊（需邀請碼，首位用戶例外） |
 | POST | `/auth/login/begin` `/finish` | 免輸入帳號的 discoverable 登入 |
 | GET/DELETE | `/auth/credentials` | 列出 / 移除 Passkey 裝置 |
@@ -571,12 +639,15 @@ VaporDrop/
 ```bash
 git clone https://github.com/tonylnng/VaporDrop.git && cd VaporDrop
 cp .env.example .env          # 至少改 SITE_ADDRESS / RP_ID / ORIGINS
+# Google 登入：填 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / ALLOWED_EMAILS
+#              UID_PEPPER=$(openssl rand -hex 32)   ← 上線後不可更改，請備份
 make up                       # docker compose up -d --build
-# 開 https://your-domain → 展開「第一次使用」→ 註冊第一個 Passkey
+# 開 https://your-domain → 點「用 Google 登入」
 make verify URL=https://your-domain
 ```
 
-之後把 `ALLOW_FIRST_USER_BOOTSTRAP` 改為 `false`，用 `make invite` 邀請其他人。
+Google Cloud Console 需登記的 redirect URI：`https://your-domain/auth/google/callback`（必須完全一致）。
+若要保留 Passkey 作備援，之後把 `ALLOW_FIRST_USER_BOOTSTRAP` 改為 `false`，用 `make invite` 邀請其他人。
 完整步驟（含 Tailscale / Cloudflare Tunnel 變體）見 **[docs/DEPLOY.md](docs/DEPLOY.md)**。
 
 接收端（VM / AI Agent）：
@@ -596,8 +667,11 @@ python3 scripts/vapor_fetch.py --all -o ./inbox
 - [ ] 一次性 token 第二次使用回 404（不洩漏存在性）。
 - [ ] 上傳 `evil.html` 後訪問，瀏覽器下載而非渲染。
 - [ ] 31 分鐘閒置後任何 API 回 401，且該用戶所有 session 已清空。
-- [ ] `python -m pytest tests -q` 全數通過（13 項）。
-- [ ] `./scripts/verify.sh https://your-domain` 15 項全過。
+- [ ] `python -m pytest tests -q` 全數通過（30 項）。
+- [ ] `./scripts/verify.sh https://your-domain` 21 項全過（Google 已啟用）。
+- [ ] 用不在 `ALLOWED_EMAILS` 內的 Google 帳號登入 → 停在首頁並顯示「此帳號不在允許清單內」，且 `app.cli users` 沒有新增帳號。
+- [ ] 登入成功後 `sqlite3 /data/vapor.db 'select * from users'`：只見 `uid` 與 `g-xxxxxxxxxx`，**無 email**。
+- [ ] `strings /data/vapor.db | grep @` 無任何 email 位址。
 - [ ] 從另一帳號嘗試存取他人 `cid` 回 404（非 403，避免存在性洩漏）。
 - [ ] 容器重啟後：Passkey 仍可登入，內容全數消失。
 - [ ] 移除 `#k=` 後開啟連結：頁面明確提示缺少金鑰，無法解密。
@@ -606,7 +680,9 @@ python3 scripts/vapor_fetch.py --all -o ./inbox
 
 ## 9. 現況與待你決定的事
 
-**現況**：程式碼、資料庫 schema、Docker 編排、接收端 CLI、驗收腳本與 13 項測試皆已完成並通過；瀏覽器端到端流程（虛擬 Passkey 註冊 → 加密上傳 → 一次性 token → 接收頁與 CLI 解密）已實測成功，伺服器端 blob 確認為密文。
+**現況**：程式碼、資料庫 schema、Docker 編排、接收端 CLI、驗收腳本與 30 項測試皆已完成並通過。兩條登入路徑都已實測：**Google 登入**以自架的假 IdP 走完真實程式路徑（PKCE 驗證、`/token` 伺服器對伺服器交換、cookie 建立、`uid` 推導），並確認 SQLite 檔案位元組內不含 email 原文；**Passkey** 端到端流程（虛擬 Passkey 註冊 → 加密上傳 → 一次性 token → 接收頁與 CLI 解密）亦成功，伺服器端 blob 確認為密文。
+
+**登入方式的決定（已定案）**：以 **Google 登入為主**（最方便、零額外硬體、不必生物認證），**Passkey 為選用備援**（抗釣魚、不依賴第三方），另有 **CLI 緊急登入連結** 作為 Google 中斷時的逃生門。取捨：Google 會知道「你何時登入」，但永遠看不到內容；資料庫也不存 email，只存 `HMAC(pepper, email)`。
 
 **仍需你決定**：
 
@@ -614,3 +690,5 @@ python3 scripts/vapor_fetch.py --all -o ./inbox
 2. **是否啟用 `ALLOW_SERVER_SIDE_PLAIN`**：開了接收端一條 `curl` 就能拿明文，代價是伺服器看得見內容。預設關。
 3. **檔案上限**：單檔 32 MB、單 session 128 MB（tmpfs 佔 RAM，調大請同步調 `MAX_BODY_SIZE` 與 tmpfs size）。
 4. **repo 可見性**：目前為 public。安全性不依賴程式碼保密，但若不想公開部署細節，建議改 private。
+5. **白名單策略**：用 `ALLOWED_EMAILS`（逐個 email，最嚴）還是 `ALLOWED_DOMAIN`（整個 Google Workspace 網域，較省事）。可並存。
+6. **`STORE_EMAIL_HANDLE`**：預設 `false`（畫面顯示 `g-xxxxxxxxxx`，最乾淨但不好認人）；改 `true` 會用 email 的 `@` 前半部當顯示名，好認但等於在資料庫留下部分個資。

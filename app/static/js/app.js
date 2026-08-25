@@ -6,7 +6,17 @@ import * as WA from './webauthn.js';
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
-let CFG = { idle_timeout: 1800, content_ttl: 600, allow_plain: false };
+let CFG = { idle_timeout: 1800, content_ttl: 600, allow_plain: false, google: false };
+
+// 伺服器只回短碼，訊息由前端翻譯（避免伺服器端回應洩漏細節）
+const AUTH_ERRORS = {
+  denied: '你在 Google 端取消了登入。',
+  state: '登入流程已逾時，請再按一次。',
+  token: '無法與 Google 完成驗證，請稍後再試。',
+  email: '此 Google 帳號的 email 未經驗證。',
+  nolist: '此帳號不在允許清單內。',
+  rescue: '緊急登入連結無效、已使用或已過期。',
+};
 let refreshTimer = null;
 let tickTimer = null;
 let lastActivity = Date.now();
@@ -49,12 +59,26 @@ async function boot() {
     `單項上限 ${fmtBytes(CFG.max_item_bytes)} · session 上限 ${fmtBytes(CFG.max_session_bytes)} · ` +
     `內容 ${Math.round(CFG.content_ttl / 60)} 分鐘後蒸發`;
 
-  if (CFG.bootstrap) {
+  if (CFG.google) {
+    show($('#btn-google'));
+    show($('#google-hint'));
+  } else {
+    $('#pk-block').open = true;
+  }
+
+  const QS = new URLSearchParams(location.search);
+  const err = QS.get('e');
+  if (err) {
+    msg($('#auth-msg'), AUTH_ERRORS[err] || '登入失敗，請重試。', 'err');
+    history.replaceState(null, '', location.pathname);
+  }
+
+  if (CFG.bootstrap && !CFG.google) {
     $('#reg-block').open = true;
     hide($('#reg-invite-row'));
     msg($('#auth-msg'), '尚未有任何帳號，請先註冊第一個 Passkey。', 'info');
   }
-  const invite = new URLSearchParams(location.search).get('invite');
+  const invite = QS.get('invite');
   if (invite) {
     $('#reg-invite').value = invite;
     $('#reg-block').open = true;
@@ -62,7 +86,7 @@ async function boot() {
     history.replaceState(null, '', location.pathname);
   }
 
-  if (!WA.supported()) {
+  if (!WA.supported() && !CFG.google) {
     msg($('#auth-msg'), '此瀏覽器不支援 Passkey，請改用 Safari / Chrome / Edge 新版。', 'err');
   }
 

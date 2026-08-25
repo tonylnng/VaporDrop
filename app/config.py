@@ -46,6 +46,47 @@ RP_NAME = os.getenv("RP_NAME", "VaporDrop")
 # 逗號分隔，必須含 scheme，例如 https://vapor.example.com
 ORIGINS = [o.strip() for o in os.getenv("ORIGINS", "http://localhost:8080").split(",") if o.strip()]
 
+# --- Google 登入（OIDC）----------------------------------------------
+# 空白 = 停用 Google 登入，只保留 Passkey。
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+# 未設定時由 ORIGINS[0] 推導出 <origin>/auth/google/callback
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
+GOOGLE_AUTH_ENDPOINT = os.getenv(
+    "GOOGLE_AUTH_ENDPOINT", "https://accounts.google.com/o/oauth2/v2/auth"
+)
+GOOGLE_TOKEN_ENDPOINT = os.getenv("GOOGLE_TOKEN_ENDPOINT", "https://oauth2.googleapis.com/token")
+
+# 白名單：逗號分隔的 email（全小寫比對）。與 ALLOWED_DOMAIN 任一命中即放行。
+ALLOWED_EMAILS = [
+    e.strip().lower() for e in os.getenv("ALLOWED_EMAILS", "").split(",") if e.strip()
+]
+# 整個 Google Workspace 網域放行；同時作為 hd 參數送給 Google。
+ALLOWED_DOMAIN = os.getenv("ALLOWED_DOMAIN", "").strip().lower()
+
+# uid = HMAC(UID_PEPPER, email)。資料庫因此只存不可逆的識別碼，不存 email 原文。
+# 一旦部署後更換此值，所有既有帳號會變成新帳號。
+UID_PEPPER = os.getenv("UID_PEPPER", "").strip()
+
+# true = handle 用 email 的 @ 前半部（好認，但等於在 DB 留下部分個資）
+# false = handle 用 g-<uid 前綴>（完全不可辨識，管理員可用 cli whois 反查）
+STORE_EMAIL_HANDLE = _bool("STORE_EMAIL_HANDLE", False)
+
+# 緊急登入連結（break-glass）有效秒數
+RESCUE_TTL = _int("RESCUE_TTL_SECONDS", 600)
+
+
+def google_enabled() -> bool:
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and UID_PEPPER)
+
+
+def google_redirect_uri() -> str:
+    if GOOGLE_REDIRECT_URI:
+        return GOOGLE_REDIRECT_URI
+    base = ORIGINS[0].rstrip("/") if ORIGINS else "http://localhost:8080"
+    return f"{base}/auth/google/callback"
+
+
 # --- Cookie -----------------------------------------------------------
 COOKIE_NAME = os.getenv("COOKIE_NAME", "vsid")
 COOKIE_SECURE = _bool("COOKIE_SECURE", True)

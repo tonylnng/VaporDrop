@@ -53,6 +53,27 @@ c="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/sessions")"
 c="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/s/doesnotexist0000000000/raw")"
 [[ "$c" == "404" ]] && ok "不存在的內容回 404（不洩漏存在性）" || bad "raw 回應 $c（應為 404）"
 
+echo "== Google 登入 =="
+state_json="$(curl -sS "$BASE/auth/state")"
+if grep -q '"google":true' <<<"$state_json"; then
+  loc="$(curl -sS -o /dev/null -D - -w '' "$BASE/auth/google/start" | grep -i '^location:' | tr -d '\r')"
+  c="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/auth/google/start")"
+  [[ "$c" == "303" ]] && ok "/auth/google/start 轉向（303）" || bad "/auth/google/start 回應 $c（應為 303）"
+  grep -q "accounts.google.com" <<<"$loc" \
+    && ok "轉向目標為 accounts.google.com" || bad "轉向目標不對：$loc"
+  grep -q "code_challenge_method=S256" <<<"$loc" \
+    && ok "已啟用 PKCE S256" || bad "轉向網址缺 PKCE code_challenge"
+  grep -q "client_secret" <<<"$loc" && bad "轉向網址洩漏 client_secret" || ok "轉向網址未洩漏 client_secret"
+  c="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/auth/google/callback?code=x&state=bogusbogusbogus")"
+  [[ "$c" == "303" ]] && ok "偽造 state 被拒（轉回首頁）" || bad "偽造 state 回應 $c"
+  c="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/auth/rescue?c=bogus")"
+  [[ "$c" == "303" ]] && ok "無效緊急碼被拒" || bad "/auth/rescue 回應 $c"
+else
+  printf '  – Google 登入未啟用（未設 GOOGLE_CLIENT_ID / UID_PEPPER），跳過這組檢查\n'
+  c="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/auth/google/start")"
+  [[ "$c" == "404" ]] && ok "未啟用時 /auth/google/start 為 404" || bad "/auth/google/start 回應 $c（應為 404）"
+fi
+
 echo "== robots =="
 curl -sS "$BASE/robots.txt" | grep -q "Disallow: /" \
   && ok "robots.txt 全站禁止索引" || bad "robots.txt 未禁止索引"

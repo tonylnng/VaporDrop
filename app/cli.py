@@ -1,8 +1,10 @@
 """管理 CLI。在容器內執行：
 
-    docker compose exec api python -m app.cli invite --note "Ian 的 MacBook"
-    docker compose exec api python -m app.cli users
-    docker compose exec api python -m app.cli purge
+    docker compose exec vapordrop-api python -m app.cli invite --note "Ian 的 MacBook"
+    docker compose exec vapordrop-api python -m app.cli users
+    docker compose exec vapordrop-api python -m app.cli whois ian@example.com
+    docker compose exec vapordrop-api python -m app.cli rescue --handle tony
+    docker compose exec vapordrop-api python -m app.cli purge
 """
 from __future__ import annotations
 
@@ -67,6 +69,55 @@ def cmd_disable(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_whois(args: argparse.Namespace) -> int:
+    """由 email 反查 uid / handle。資料庫不存 email，只能靠 pepper 正向推算。"""
+    db.init()
+    if not config.UID_PEPPER:
+        print("未設定 UID_PEPPER，無法推算", file=sys.stderr)
+        return 1
+    from .google_auth import handle_for, uid_for_email
+
+    uid = uid_for_email(args.email)
+    user = db.get_user(uid)
+    print("email  ：", args.email.strip().lower())
+    print("uid    ：", uid)
+    print("預期 handle：", handle_for(args.email, uid))
+    if user:
+        print("狀態   ：", "已停用" if user["disabled"] else "正常")
+        print("實際 handle：", user["handle"])
+        print("建立於 ：", _fmt(user["created_at"]))
+    else:
+        print("狀態   ： 尚未登入過（資料庫沒有這一列）")
+    return 0
+
+
+def cmd_rescue(args: argparse.Namespace) -> int:
+    """產生一次性緊急登入連結（Google 掛掉時的逃生門）。"""
+    db.init()
+    user = db.get_user_by_handle(args.handle)
+    if user is None:
+        if not args.create:
+            print(
+                f"找不到 handle {args.handle}；若要同時建立此帳號請加 --create",
+                file=sys.stderr,
+            )
+            return 1
+        uid = db.create_user(args.handle)
+        print(f"已建立帳號 {args.handle}（uid={uid}）")
+    else:
+        uid = user["uid"]
+        if user["disabled"]:
+            print("警告：此帳號目前為停用狀態，連結將無法登入", file=sys.stderr)
+
+    code, expires = db.create_rescue_code(uid, ttl=args.ttl or config.RESCUE_TTL)
+    base = args.base_url or (config.ORIGINS[0] if config.ORIGINS else "https://localhost")
+    print("緊急登入連結：", f"{base}/auth/rescue?c={code}")
+    print("有效至：", _fmt(expires))
+    print()
+    print("提醒：一次性使用，用畢或過期即失效。資料庫只存雜湊，此連結不會再出現第二次。")
+    return 0
+
+
 def cmd_purge(args: argparse.Namespace) -> int:
     """緊急清除：抹掉 tmpfs 上所有密文。不影響 Passkey 憑證。"""
     import shutil
@@ -100,6 +151,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("handle")
     p.add_argument("--enable", action="store_true", help="改為啟用")
     p.set_defaults(func=cmd_disable)
+
+    p = sub.add_parser("whois", help="由 email 反查 uid / handle")
+    p.add_argument("email")
+    p.set_defaults(func=cmd_whois)
+
+    p = sub.add_parser("rescue", help="產生一次性緊急登入連結（Google 不可用時）")
+    p.add_argument("--handle", required=True, help="要登入的帳號 handle")
+    p.add_argument("--create", action="store_true", help="帳號不存在時一併建立")
+    p.add_argument("--ttl", type=int, default=None, help="有效秒數，預設 600")
+    p.add_argument("--base-url", default="", help="用於組出連結")
+    p.set_defaults(func=cmd_rescue)
 
     p = sub.add_parser("purge", help="立即抹除 tmpfs 上所有密文")
     p.set_defaults(func=cmd_purge)

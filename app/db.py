@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import sqlite3
@@ -45,6 +46,17 @@ CREATE TABLE IF NOT EXISTS invites (
     note        TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_invites_expires ON invites(expires_at);
+
+-- 緊急登入（break-glass）一次性碼。只存雜湊，原文只在產生時印在終端。
+CREATE TABLE IF NOT EXISTS rescue_codes (
+    code_hash   TEXT PRIMARY KEY,
+    uid         TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    used_at     INTEGER,
+    FOREIGN KEY (uid) REFERENCES users(uid) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rescue_expires ON rescue_codes(expires_at);
 """
 
 
@@ -76,6 +88,38 @@ def create_user(handle: str) -> str:
             (uid, handle, int(time.time())),
         )
     return uid
+
+
+def ensure_user(uid: str, handle_hint: str) -> dict[str, Any]:
+    """以既定 uid 建立或取回用戶（Google 登入用）。
+
+    uid 由 HMAC(UID_PEPPER, email) 決定，因此同一個 email 每次登入都對到同一列，
+    而資料庫裡完全沒有 email 原文。handle 只是給管理員看的顯示名，衝突時加尾碼。
+    """
+    existing = get_user(uid)
+    if existing:
+        return existing
+    base = handle_hint or f"g-{uid[:10]}"
+    with _connect() as conn:
+        for attempt in range(20):
+            handle = base if attempt == 0 else f"{base}-{attempt + 1}"
+            try:
+                conn.execute(
+                    "INSERT INTO users (uid, handle, created_at) VALUES (?, ?, ?)",
+                    (uid, handle, int(time.time())),
+                )
+                break
+            except sqlite3.IntegrityError:
+                # uid 已存在 = 併發登入，直接回既有列
+                if conn.execute(
+                    "SELECT 1 FROM users WHERE uid = ?", (uid,)
+                ).fetchone():
+                    break
+                continue  # handle 撞名，換一個
+    user = get_user(uid)
+    if user is None:  # pragma: no cover - 理論上不可能
+        raise RuntimeError("user creation failed")
+    return user
 
 
 def get_user_by_handle(handle: str) -> dict[str, Any] | None:
@@ -185,6 +229,53 @@ def release_invite(code: str) -> None:
     """註冊失敗時歸還邀請碼。"""
     with _connect() as conn:
         conn.execute("UPDATE invites SET used_at = NULL WHERE code = ? AND used_by IS NULL", (code,))
+
+
+# --- 緊急登入碼 -------------------------------------------------------
+def create_rescue_code(uid: str, ttl: int) -> tuple[str, int]:
+    """回傳 (原文碼, 到期時間)。資料庫只留 SHA-256 雜湊。"""
+    code = secrets.token_urlsafe(32)
+    now = int(time.time())
+    expires = now + ttl
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO rescue_codes (code_hash, uid, created_at, expires_at)
+               VALUES (?, ?, ?, ?)""",
+            (_hash_code(code), uid, now, expires),
+        )
+    return code, expires
+
+
+def consume_rescue_code(code: str) -> str | None:
+    """原子性消耗；成功回 uid，失敗（不存在／已用／過期）回 None。"""
+    now = int(time.time())
+    digest = _hash_code(code)
+    with _connect() as conn:
+        cur = conn.execute(
+            """UPDATE rescue_codes SET used_at = ?
+               WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?""",
+            (now, digest, now),
+        )
+        if cur.rowcount != 1:
+            return None
+        row = conn.execute(
+            "SELECT uid FROM rescue_codes WHERE code_hash = ?", (digest,)
+        ).fetchone()
+    return row["uid"] if row else None
+
+
+def _hash_code(code: str) -> str:
+    return hashlib.sha256(code.encode()).hexdigest()
+
+
+def purge_expired_rescue_codes() -> int:
+    now = int(time.time())
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM rescue_codes WHERE expires_at < ? OR used_at IS NOT NULL",
+            (now,),
+        )
+        return cur.rowcount
 
 
 def purge_expired_invites() -> int:

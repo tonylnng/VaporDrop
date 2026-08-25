@@ -24,11 +24,19 @@
     <div class="card center">
       <h1>零知識暫存傳送門</h1>
       <p class="muted">內容 10 分鐘自動蒸發，伺服器只見密文，不留日誌。</p>
-      <button id="btn-login" class="btn primary big">用 Passkey 登入</button>
+      <a id="btn-google" class="btn primary big hidden" href="/auth/google/start">用 Google 登入</a>
       <p id="auth-msg" class="msg"></p>
+      <p id="google-hint" class="muted small hidden">
+        只有白名單內的 Google 帳號可以進入。伺服器不會保存你的 email 原文。
+      </p>
       <hr>
+      <details id="pk-block">
+        <summary>改用 Passkey 登入</summary>
+        <p class="muted small">適合不想使用 Google 帳號、或需要抗釣魚保證的場合。</p>
+        <button id="btn-login" class="btn">用 Passkey 登入</button>
+      </details>
       <details id="reg-block">
-        <summary>第一次使用 / 我有邀請碼</summary>
+        <summary>第一次使用 Passkey / 我有邀請碼</summary>
         <label>Handle
           <input id="reg-handle" type="text" autocomplete="username webauthn"
                  placeholder="3-32 個字母、數字、. _ -" maxlength="32">
@@ -65,7 +73,7 @@
 
     <div class="card">
       <details>
-        <summary>我的 Passkey 裝置</summary>
+        <summary>我的 Passkey 裝置（選用）</summary>
         <div id="creds"></div>
         <button id="btn-add-cred" class="btn ghost">新增這台裝置</button>
       </details>

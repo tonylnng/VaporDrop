@@ -84,6 +84,10 @@ button, input, textarea, select { font: inherit; color: inherit; }
 .btn.danger:hover { border-color: var(--err); }
 .btn.big { padding: 12px 22px; font-size: 16px; margin: 14px 0 6px; }
 .btn.small { padding: 5px 10px; font-size: 12.5px; }
+/* <a class="btn"> 用於 Google 登入：必須是整塊、無底線、與 <button> 同外觀 */
+a.btn { display: inline-block; text-decoration: none; color: inherit; text-align: center; }
+details#pk-block, details#reg-block { margin-top: 8px; }
+details#pk-block .btn { margin-top: 8px; }
 .file-label { display: inline-block; text-align: center; }
 
 input[type="text"], input[type="number"], textarea {

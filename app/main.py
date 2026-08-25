@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import auth_routes, config, db, security, session_routes, store
+from . import auth_routes, config, db, google_auth, security, session_routes, store
 
 # 把可能寫出請求細節的 logger 全部關掉
 for name in ("uvicorn.access", "uvicorn.error", "fastapi", "asyncio"):
@@ -31,6 +31,7 @@ async def _sweeper() -> None:
         try:
             await store.sweep_once()
             await asyncio.to_thread(db.purge_expired_invites)
+            await asyncio.to_thread(db.purge_expired_rescue_codes)
         except Exception:
             pass  # 絕不記錄細節
         await asyncio.sleep(config.SWEEP_INTERVAL)
@@ -61,6 +62,7 @@ app = FastAPI(
 )
 app.add_middleware(security.SecurityHeadersMiddleware)
 app.include_router(auth_routes.router)
+app.include_router(google_auth.router)
 app.include_router(session_routes.router)
 
 
